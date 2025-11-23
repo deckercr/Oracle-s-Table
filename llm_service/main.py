@@ -7,6 +7,7 @@ from pathlib import Path
 import requests
 import torch
 import psycopg2
+import os
 
 app = FastAPI()
 
@@ -17,18 +18,18 @@ DND_API_BASE = "https://www.dnd5eapi.co/api"
 
 # Ensure cache directory exists
 cache_dir = Path(os.getenv("HF_HOME", "/data/model_cache"))
-cache_dir.mkdir(parents=True, exist_ok=True)  # Creates if doesn't exist
+cache_dir.mkdir(parents=True, exist_ok=True)
 
 print("Loading Llama...")
 pipe = pipeline(
     "text-generation", 
     model="meta-llama/Llama-3.2-3B-Instruct", 
     device_map="auto",
-    torch_dtype=torch.float16,  # Use half precision
-    model_kwargs={"low_cpu_mem_usage": True}
-    cache_dir=str(cache_dir),  # Tell HF where to cache
+    torch_dtype=torch.float16,
+    model_kwargs={"low_cpu_mem_usage": True},
+    cache_dir=str(cache_dir),
     token=os.getenv("HF_TOKEN")
-    )
+)
 
 class GameRequest(BaseModel):
     prompt: str
@@ -37,7 +38,7 @@ class GameRequest(BaseModel):
 def get_dnd_context(query):
     # Expanded to check classes and races
     endpoints = ["spells", "monsters", "classes", "races"]
-    query_term = query.split()[-1].lower() # simplistic keyword extraction
+    query_term = query.split()[-1].lower()
     
     for endpoint in endpoints:
         try:
@@ -46,7 +47,6 @@ def get_dnd_context(query):
             if resp['count'] > 0:
                 index = resp['results'][0]['index']
                 details = requests.get(f"{DND_API_BASE}/{endpoint}/{index}").json()
-                # Return a summarized rule snippet
                 return f"RULE ({endpoint}): {details.get('name')}. {str(details.get('desc', ''))[:200]}..."
         except:
             continue
@@ -74,7 +74,6 @@ async def dm_turn(req: GameRequest):
     # 4. Optional: Call Image Generator
     if req.generate_image:
         try:
-            # We ask the image container to make art based on the AI's description
             img_req = requests.post(IMAGE_API, json={"description": response_text[:100]})
             if img_req.status_code == 200:
                 image_url = img_req.json()["image_path"]
@@ -94,3 +93,7 @@ async def dm_turn(req: GameRequest):
         "image": image_url,
         "audio": audio_status
     }
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "service": "llm_brain"}

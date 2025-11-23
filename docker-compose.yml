@@ -21,14 +21,13 @@ services:
     build: ./llm_service
     container_name: dnd_llm
     ports:
-      - "8000:8000"
+      - "8000:8000"  # Exposed for external testing
     volumes:
-      - model_cache:/data/model_cache  # Docker handles creation
+      - model_cache:/data/model_cache
     environment:
-      - HF_TOKEN=${HF_TOKEN}  # Pass token from your shell or .env file
-      # Tell Hugging Face library where to look for the cache
+      - HF_TOKEN=${HF_TOKEN}
       - HF_HOME=/data/model_cache
-      - DB_HOST=database      # Knows to talk to 'database' container
+      - DB_HOST=database
     depends_on:
       - database
       - image_gen
@@ -67,22 +66,22 @@ services:
     networks:
       - dm_network
     deploy:
-    resources:
-      reservations:
-        devices:
-          - driver: nvidia
-            count: all
-            capabilities: [gpu]
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   # 5. DJANGO WEB APP ( The Interface )
   webapp:
     build: ./web_service
     container_name: dnd_website
     ports:
-      - "8080:8000"  # You will access the site at http://localhost:8080
+      - "8080:8000"
     volumes:
-      - ./web_service:/app           # Syncs code so you can edit without rebuilding
-      - /var/run/docker.sock:/var/run/docker.sock # ALLOWS DJANGO TO CONTROL DOCKER
+      - ./web_service:/app
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - database
     environment:
@@ -99,5 +98,5 @@ networks:
 
 volumes:
   postgres_data:
-  model_cache:      # Docker creates and manages this
+  model_cache:
   shared_images:
