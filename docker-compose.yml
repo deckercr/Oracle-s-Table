@@ -1,0 +1,92 @@
+version: '3.8'
+
+services:
+  # 1. THE DATABASE (PostgreSQL + Vector Support)
+  database:
+    image: pgvector/pgvector:pg16
+    container_name: dnd_postgres
+    environment:
+      POSTGRES_USER: dm_admin
+      POSTGRES_PASSWORD: secretpassword
+      POSTGRES_DB: dungeon_data
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - dm_network
+
+  # 2. THE BRAIN (Llama 3.2)
+  llm_brain:
+    build: ./llm_service
+    container_name: dnd_llm
+    ports:
+      - "8000:8000"
+    environment:
+      - HF_TOKEN=${HF_TOKEN}  # Pass token from your shell or .env file
+      # Tell Hugging Face library where to look for the cache
+      - HF_HOME=/data/model_cache
+      - DB_HOST=database      # Knows to talk to 'database' container
+    depends_on:
+      - database
+      - image_gen
+    networks:
+      - dm_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # 3. THE ARTIST (Stable Diffusion)
+  image_gen:
+    build: ./image_service
+    container_name: dnd_artist
+    expose:
+      - "8001"
+    networks:
+      - dm_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # 4. THE VOICE (TTS)
+  tts_voice:
+    build: ./tts_service
+    container_name: dnd_voice
+    expose:
+      - "8002"
+    networks:
+      - dm_network
+
+  # 5. DJANGO WEB APP ( The Interface )
+  webapp:
+    build: ./web_service
+    container_name: dnd_website
+    ports:
+      - "8080:8000"  # You will access the site at http://localhost:8080
+    volumes:
+      - ./web_service:/app           # Syncs code so you can edit without rebuilding
+      - /var/run/docker.sock:/var/run/docker.sock # ALLOWS DJANGO TO CONTROL DOCKER
+    depends_on:
+      - database
+    environment:
+      - DB_HOST=database
+      - DB_NAME=dungeon_data
+      - DB_USER=dm_admin
+      - DB_PASS=secretpassword
+    networks:
+      - dm_network
+
+networks:
+  dm_network:
+    driver: bridge
+
+volumes:
+  postgres_data:

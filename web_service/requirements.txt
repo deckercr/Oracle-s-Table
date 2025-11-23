@@ -1,0 +1,4 @@
+django
+psycopg2-binary
+requests
+docker  # The library to control containers
