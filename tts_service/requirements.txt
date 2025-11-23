@@ -1,4 +1,8 @@
 fastapi
 uvicorn
-gTTS
-pydub
+TTS
+torch
+numpy
+scipy
+soundfile
+librosa
