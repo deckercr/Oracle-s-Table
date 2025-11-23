@@ -26,14 +26,17 @@ pipe = pipeline(
     model="meta-llama/Llama-3.2-3B-Instruct", 
     device_map="auto",
     torch_dtype=torch.float16,
-    model_kwargs={"low_cpu_mem_usage": True},
-    cache_dir=str(cache_dir),
+    model_kwargs={
+        "low_cpu_mem_usage": True,
+        "cache_dir": str(cache_dir)
+    },
     token=os.getenv("HF_TOKEN")
 )
 
 class GameRequest(BaseModel):
     prompt: str
     generate_image: bool = False
+    image_style: str = "fantasy"  # fantasy, dark, epic, cinematic, painterly
 
 def get_dnd_context(query):
     # Expanded to check classes and races
@@ -76,22 +79,33 @@ async def dm_turn(req: GameRequest):
         try:
             img_req = requests.post(IMAGE_API, json={"description": response_text[:100]})
             if img_req.status_code == 200:
-                image_url = img_req.json()["image_path"]
-        except:
-            image_url = "Error generating image"
+                img_data = img_req.json()
+                if img_data.get("status") == "success":
+                    # Return full URL that client can access
+                    image_url = f"http://image_gen:8001{img_data['image_url']}"
+        except Exception as e:
+            image_url = f"Error: {str(e)}"
 
     # 5. Always generate Audio (TTS)
+    audio_url = None
     try:
-        requests.post(TTS_API, json={"text": response_text})
-        audio_status = "sent to speakers"
-    except:
-        audio_status = "tts failed"
+        # For multi-speaker models, specify a speaker (p230 is a good default voice)
+        tts_req = requests.post(TTS_API, json={"text": response_text[:500], "speaker": "p230"})
+        if tts_req.status_code == 200:
+            tts_data = tts_req.json()
+            if tts_data.get("status") == "success":
+                # Return full URL that client can access
+                audio_url = f"http://tts_voice:8002{tts_data['audio_url']}"
+                audio_status = "generated"
+    except Exception as e:
+        audio_status = f"tts error: {str(e)}"
 
     return {
         "text": response_text,
         "rule_ref": rule_context,
-        "image": image_url,
-        "audio": audio_status
+        "image_url": image_url,
+        "audio_url": audio_url,
+        "audio_status": audio_status
     }
 
 @app.get("/health")

@@ -45,8 +45,8 @@ services:
   image_gen:
     build: ./image_service
     container_name: dnd_artist
-    expose:
-      - "8001"
+    ports:
+      - "8001:8001"  # Changed from expose to ports
     networks:
       - dm_network
     deploy:
@@ -61,8 +61,8 @@ services:
   tts_voice:
     build: ./tts_service
     container_name: dnd_voice
-    expose:
-      - "8002"
+    ports:
+      - "8002:8002"  # Changed from expose to ports
     networks:
       - dm_network
     deploy:
