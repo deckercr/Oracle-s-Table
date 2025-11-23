@@ -1,3 +1,5 @@
+# ./image_service/main.py
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 from diffusers import StableDiffusionPipeline
