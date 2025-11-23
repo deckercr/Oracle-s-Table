@@ -1,18 +1,31 @@
-FROM python:3.10-slim
+# ./web_service/Dockerfile
+
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system tools needed for Python DB and Docker connection
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
-    libpq-dev \
-    gcc \
+    postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
+# Copy requirements and install
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# We don't copy the code here because we use a Volume in docker-compose
-# This allows you to edit code on your computer and see changes instantly.
+# Copy entire Django project
+COPY . .
 
-# Run Django on port 8000 (internal)
-CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+# Create necessary directories
+RUN mkdir -p /shared/images /shared/audio staticfiles
+
+# Collect static files (will run even if it fails)
+RUN python manage.py collectstatic --noinput || true
+
+EXPOSE 8000
+
+# Start script that runs migrations then starts server
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

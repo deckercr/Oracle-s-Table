@@ -3,6 +3,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from transformers import pipeline
+from pathlib import Path
 import requests
 import torch
 import psycopg2
@@ -14,8 +15,20 @@ IMAGE_API = "http://image_gen:8001/generate_image"
 TTS_API = "http://tts_voice:8002/speak"
 DND_API_BASE = "https://www.dnd5eapi.co/api"
 
+# Ensure cache directory exists
+cache_dir = Path(os.getenv("HF_HOME", "/data/model_cache"))
+cache_dir.mkdir(parents=True, exist_ok=True)  # Creates if doesn't exist
+
 print("Loading Llama...")
-pipe = pipeline("text-generation", model="meta-llama/Llama-3.2-3B-Instruct", device_map="auto")
+pipe = pipeline(
+    "text-generation", 
+    model="meta-llama/Llama-3.2-3B-Instruct", 
+    device_map="auto",
+    torch_dtype=torch.float16,  # Use half precision
+    model_kwargs={"low_cpu_mem_usage": True}
+    cache_dir=str(cache_dir),  # Tell HF where to cache
+    token=os.getenv("HF_TOKEN")
+    )
 
 class GameRequest(BaseModel):
     prompt: str

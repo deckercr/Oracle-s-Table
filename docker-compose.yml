@@ -22,6 +22,8 @@ services:
     container_name: dnd_llm
     ports:
       - "8000:8000"
+    volumes:
+      - model_cache:/data/model_cache  # Docker handles creation
     environment:
       - HF_TOKEN=${HF_TOKEN}  # Pass token from your shell or .env file
       # Tell Hugging Face library where to look for the cache
@@ -37,7 +39,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
 
   # 3. THE ARTIST (Stable Diffusion)
@@ -53,7 +55,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
 
   # 4. THE VOICE (TTS)
@@ -90,3 +92,5 @@ networks:
 
 volumes:
   postgres_data:
+  model_cache:      # Docker creates and manages this
+  shared_images:
