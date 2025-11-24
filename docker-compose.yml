@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # 1. THE DATABASE (PostgreSQL + Vector Support)
   database:
@@ -15,40 +13,34 @@ services:
       - "5432:5432"
     networks:
       - dm_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dm_admin"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
-  # 2. THE BRAIN (Llama 3.2)
-  llm_brain:
-    build: ./llm_service
-    container_name: dnd_llm
-    ports:
-      - "8000:8000"  # Exposed for external testing
-    volumes:
-      - model_cache:/data/model_cache
-    environment:
-      - HF_TOKEN=${HF_TOKEN}
-      - HF_HOME=/data/model_cache
-      - DB_HOST=database
-    depends_on:
-      - database
-      - image_gen
-    networks:
-      - dm_network
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-  # 3. THE ARTIST (Stable Diffusion)
+  # 3. THE ARTIST (Stable Diffusion) - Start before LLM
   image_gen:
     build: ./image_service
     container_name: dnd_artist
     ports:
-      - "8001:8001"  # Changed from expose to ports
+      - "8001:8001"
+    volumes:
+      - shared_images:/shared/images
+      # HOST PATH - Models persist on your machine!
+      - ${MODEL_CACHE_PATH:-./model_cache}/diffusers:/data/model_cache
+    environment:
+      - HF_HOME=/data/model_cache
+      - TRANSFORMERS_CACHE=/data/model_cache
+      - DIFFUSERS_CACHE=/data/model_cache
     networks:
       - dm_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
     deploy:
       resources:
         reservations:
@@ -57,14 +49,29 @@ services:
               count: all
               capabilities: [gpu]
 
-  # 4. THE VOICE (TTS)
+  # 4. THE VOICE (TTS) - Start before LLM
   tts_voice:
     build: ./tts_service
     container_name: dnd_voice
     ports:
-      - "8002:8002"  # Changed from expose to ports
+      - "8002:8002"
+    volumes:
+      - shared_audio:/shared/audio
+      # Map cache so model downloads persist (approx 2GB)
+      - ~/dnd_models/tts_cache:/root/.cache/huggingface
+      # Map your reference voices
+      - ~/dnd_models/reference_voices:/shared/reference_voices
+    environment:
+      - COQUI_TTS_CACHE=/data/tts_cache
+      - TTS_CACHE=/data/tts_cache
     networks:
       - dm_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
     deploy:
       resources:
         reservations:
@@ -73,7 +80,44 @@ services:
               count: all
               capabilities: [gpu]
 
-  # 5. DJANGO WEB APP ( The Interface )
+  # 2. THE BRAIN (Llama 3.2) - Starts after support services
+  llm_brain:
+    build: ./llm_service
+    container_name: dnd_llm
+    ports:
+      - "8000:8000"
+    volumes:
+      # HOST PATH - HuggingFace models persist on your machine!
+      - ${MODEL_CACHE_PATH:-./model_cache}/huggingface:/data/model_cache
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - HF_HOME=/data/model_cache
+      - TRANSFORMERS_CACHE=/data/model_cache
+      - DB_HOST=database
+    depends_on:
+      database:
+        condition: service_healthy
+      image_gen:
+        condition: service_healthy
+      tts_voice:
+        condition: service_healthy
+    networks:
+      - dm_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 240s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # 5. DJANGO WEB APP (The Interface) - Starts last
   webapp:
     build: ./web_service
     container_name: dnd_website
@@ -82,21 +126,33 @@ services:
     volumes:
       - ./web_service:/app
       - /var/run/docker.sock:/var/run/docker.sock
+      - shared_images:/shared/images
+      - shared_audio:/shared/audio
     depends_on:
-      - database
+      database:
+        condition: service_healthy
+      llm_brain:
+        condition: service_healthy
     environment:
       - DB_HOST=database
       - DB_NAME=dungeon_data
       - DB_USER=dm_admin
       - DB_PASS=secretpassword
+      - LLM_API=http://llm_brain:8000
+      - IMAGE_API=http://image_gen:8001
+      - TTS_API=http://tts_voice:8002
     networks:
       - dm_network
 
 networks:
   dm_network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/16
 
 volumes:
   postgres_data:
-  model_cache:
   shared_images:
+  shared_audio:
+  # No more model_cache or tts_cache - using host paths now!

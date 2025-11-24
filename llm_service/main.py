@@ -1,4 +1,8 @@
 # ./llm_service/main.py
+"""
+LLM service updated to work with Chatterbox TTS.
+Uses 'exaggeration' for emotion control.
+"""
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -6,12 +10,16 @@ from transformers import pipeline
 from pathlib import Path
 import requests
 import torch
-import psycopg2
 import os
+import time
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# INTERNAL NETWORK ADDRESSES (Defined in docker-compose)
+# INTERNAL NETWORK ADDRESSES
 IMAGE_API = "http://image_gen:8001/generate_image"
 TTS_API = "http://tts_voice:8002/speak"
 DND_API_BASE = "https://www.dnd5eapi.co/api"
@@ -20,38 +28,53 @@ DND_API_BASE = "https://www.dnd5eapi.co/api"
 cache_dir = Path(os.getenv("HF_HOME", "/data/model_cache"))
 cache_dir.mkdir(parents=True, exist_ok=True)
 
-print("Loading Llama...")
-pipe = pipeline(
-    "text-generation", 
-    model="meta-llama/Llama-3.2-3B-Instruct", 
-    device_map="auto",
-    torch_dtype=torch.float16,
-    model_kwargs={
-        "low_cpu_mem_usage": True,
-        "cache_dir": str(cache_dir)
-    },
-    token=os.getenv("HF_TOKEN")
-)
+logger.info("Loading Llama 3.2...")
+
+try:
+    pipe = pipeline(
+        "text-generation",
+        model="meta-llama/Llama-3.2-3B-Instruct",
+        device_map="auto",
+        torch_dtype=torch.float16,
+        model_kwargs={
+            "low_cpu_mem_usage": True,
+            "cache_dir": str(cache_dir)
+        },
+        token=os.getenv("HF_TOKEN")
+    )
+    logger.info("✓ Llama model loaded successfully!")
+except Exception as e:
+    logger.error(f"Failed to load Llama model: {e}")
+    raise
 
 class GameRequest(BaseModel):
     prompt: str
     generate_image: bool = False
-    image_style: str = "fantasy"  # fantasy, dark, epic, cinematic, painterly
+    image_style: str = "fantasy"
+    # CHANGE 1: Default to "gandalf" to match your file name
+    voice: str = "gandalf" 
+
+def check_service_health(url, timeout=2):
+    """Quick non-blocking check if service is available"""
+    try:
+        response = requests.get(url, timeout=timeout)
+        return response.status_code == 200
+    except:
+        return False
 
 def get_dnd_context(query):
-    # Expanded to check classes and races
     endpoints = ["spells", "monsters", "classes", "races"]
     query_term = query.split()[-1].lower()
-    
     for endpoint in endpoints:
         try:
             url = f"{DND_API_BASE}/{endpoint}?name={query_term}"
-            resp = requests.get(url).json()
-            if resp['count'] > 0:
+            resp = requests.get(url, timeout=3).json()
+            if resp.get('count', 0) > 0:
                 index = resp['results'][0]['index']
-                details = requests.get(f"{DND_API_BASE}/{endpoint}/{index}").json()
+                details = requests.get(f"{DND_API_BASE}/{endpoint}/{index}", timeout=3).json()
                 return f"RULE ({endpoint}): {details.get('name')}. {str(details.get('desc', ''))[:200]}..."
-        except:
+        except Exception as e:
+            logger.debug(f"No {endpoint} found: {e}")
             continue
     return None
 
@@ -59,55 +82,133 @@ def get_dnd_context(query):
 async def dm_turn(req: GameRequest):
     # 1. Get Rules
     rule_context = get_dnd_context(req.prompt)
-    
+
     # 2. Build Prompt
-    system_msg = "You are a DM. Be vivid. Use the rules provided."
+    system_msg = """You are a Dungeon Master. Be vivid and descriptive. 
+    Always complete your sentences and thoughts fully. 
+    Describe scenes in rich detail but keep responses focused and complete."""
+
     full_prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_msg}"
     if rule_context:
         full_prompt += f" Rules: {rule_context}"
     full_prompt += f"<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{req.prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
 
     # 3. Generate Text
-    outputs = pipe(full_prompt, max_new_tokens=250)
+    logger.info(f"Generating response for: {req.prompt[:50]}...")
+    outputs = pipe(
+        full_prompt,
+        max_new_tokens=512,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+        eos_token_id=pipe.tokenizer.eos_token_id
+    )
     response_text = outputs[0]["generated_text"].split("assistant<|end_header_id|>\n\n")[-1]
+
+    # Clean up any incomplete sentences
+    if response_text and not response_text.rstrip().endswith(('.', '!', '?', '"', "'")):
+        last_period = max(
+            response_text.rfind('.'),
+            response_text.rfind('!'),
+            response_text.rfind('?')
+        )
+        if last_period > 0:
+            response_text = response_text[:last_period + 1]
+
+    logger.info(f"✓ Generated {len(response_text)} characters")
 
     image_url = None
     audio_status = "skipped"
+    audio_url = None
 
     # 4. Optional: Call Image Generator
     if req.generate_image:
         try:
-            img_req = requests.post(IMAGE_API, json={"description": response_text[:100]})
-            if img_req.status_code == 200:
-                img_data = img_req.json()
-                if img_data.get("status") == "success":
-                    # Return full URL that client can access
-                    image_url = f"http://image_gen:8001{img_data['image_url']}"
+            if check_service_health("http://image_gen:8001/health", timeout=1):
+                logger.info("Requesting image generation...")
+                img_req = requests.post(
+                    IMAGE_API,
+                    json={"description": response_text[:100], "style": req.image_style},
+                    timeout=60
+                )
+                if img_req.status_code == 200:
+                    img_data = img_req.json()
+                    if img_data.get("status") == "success":
+                        image_url = f"http://image_gen:8001{img_data['image_url']}"
+                        logger.info(f"✓ Image generated: {image_url}")
+            else:
+                logger.warning("Image service not available")
+                image_url = "Service unavailable"
         except Exception as e:
+            logger.error(f"Image generation error: {e}")
             image_url = f"Error: {str(e)}"
 
-    # 5. Always generate Audio (TTS)
-    audio_url = None
+    # 5. Generate Audio with Chatterbox
     try:
-        # For multi-speaker models, specify a speaker (p230 is a good default voice)
-        tts_req = requests.post(TTS_API, json={"text": response_text[:500], "speaker": "p230"})
-        if tts_req.status_code == 200:
-            tts_data = tts_req.json()
-            if tts_data.get("status") == "success":
-                # Return full URL that client can access
-                audio_url = f"http://tts_voice:8002{tts_data['audio_url']}"
-                audio_status = "generated"
+        if check_service_health("http://tts_voice:8002/health", timeout=1):
+            logger.info(f"Requesting TTS with voice '{req.voice}'...")
+            
+            # CHANGE 2: Updated payload for Chatterbox (removed speed/language, added exaggeration)
+            tts_req = requests.post(
+                TTS_API,
+                json={
+                    "text": response_text,
+                    "voice": req.voice,
+                    "exaggeration": 0.6,  # Emotion intensity (0.0 - 1.0)
+                    "temperature": 0.7    # Creativity/Randomness
+                },
+                # CHANGE 3: Increased timeout for safety
+                timeout=60
+            )
+            
+            if tts_req.status_code == 200:
+                tts_data = tts_req.json()
+                if tts_data.get("status") == "success":
+                    # The TTS service returns "/audio/{uuid}", we prepend host for webapp
+                    audio_url = f"http://tts_voice:8002{tts_data['audio_url']}"
+                    audio_status = "generated"
+                    cloned = tts_data.get("cloned", False)
+                    logger.info(f"✓ Audio generated (cloned={cloned}): {audio_url}")
+                else:
+                    logger.warning(f"TTS returned non-success: {tts_data}")
+                    audio_status = "TTS failed"
+            else:
+                logger.warning(f"TTS request failed: HTTP {tts_req.status_code}")
+                audio_status = f"HTTP {tts_req.status_code}"
+        else:
+            logger.warning("TTS service not available")
+            audio_status = "Service unavailable"
     except Exception as e:
-        audio_status = f"tts error: {str(e)}"
+        logger.error(f"TTS error: {e}")
+        audio_status = f"Error: {str(e)}"
 
     return {
         "text": response_text,
         "rule_ref": rule_context,
         "image_url": image_url,
         "audio_url": audio_url,
-        "audio_status": audio_status
+        "audio_status": audio_status,
+        "voice_used": req.voice
     }
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "llm_brain"}
+    return {
+        "status": "healthy",
+        "service": "llm_brain",
+        "model_loaded": pipe is not None
+    }
+
+@app.get("/")
+async def root():
+    return {
+        "service": "D&D LLM Brain",
+        "status": "running",
+        "tts": "Chatterbox (Emotion Enabled)",
+        "endpoints": {
+            "health": "/health",
+            "dm_turn": "/dm_turn (POST)"
+        }
+    }
+
+logger.info("🎲 LLM Service ready with Chatterbox support!")

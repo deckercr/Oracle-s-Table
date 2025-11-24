@@ -1,8 +1,11 @@
-fastapi
-uvicorn
-TTS
+fastapi==0.109.0
+uvicorn==0.27.0
+python-multipart==0.0.9
+chatterbox-tts>=0.1.2
 torch
-numpy
-scipy
-soundfile
+torchaudio
 librosa
+soundfile
+pydub
+inflect
+unidecode
