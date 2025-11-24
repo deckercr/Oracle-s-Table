@@ -2,6 +2,7 @@
 """
 LLM service updated to work with Chatterbox TTS.
 Uses 'exaggeration' for emotion control.
+Optimized for shorter, punchier narrations that work well with TTS.
 """
 
 from fastapi import FastAPI
@@ -51,7 +52,6 @@ class GameRequest(BaseModel):
     prompt: str
     generate_image: bool = False
     image_style: str = "fantasy"
-    # CHANGE 1: Default to "gandalf" to match your file name
     voice: str = "gandalf" 
 
 def check_service_health(url, timeout=2):
@@ -83,21 +83,23 @@ async def dm_turn(req: GameRequest):
     # 1. Get Rules
     rule_context = get_dnd_context(req.prompt)
 
-    # 2. Build Prompt
-    system_msg = """You are a Dungeon Master. Be vivid and descriptive. 
-    Always complete your sentences and thoughts fully. 
-    Describe scenes in rich detail but keep responses focused and complete."""
+    # 2. Build Prompt - UPDATED for shorter, punchier responses
+    system_msg = """You are a Dungeon Master. Be vivid but concise. 
+    Keep responses to 2-4 sentences maximum - roughly 150-200 words.
+    Focus on the most important and dramatic details.
+    Always complete your thoughts fully but keep it brief and impactful.
+    Think of it like narrating a crucial moment, not describing everything."""
 
     full_prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_msg}"
     if rule_context:
         full_prompt += f" Rules: {rule_context}"
     full_prompt += f"<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{req.prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
 
-    # 3. Generate Text
+    # 3. Generate Text - REDUCED from 512 to 256 tokens (~150-200 words)
     logger.info(f"Generating response for: {req.prompt[:50]}...")
     outputs = pipe(
         full_prompt,
-        max_new_tokens=512,
+        max_new_tokens=256,  # Reduced from 512
         do_sample=True,
         temperature=0.7,
         top_p=0.9,
@@ -148,16 +150,14 @@ async def dm_turn(req: GameRequest):
         if check_service_health("http://tts_voice:8002/health", timeout=1):
             logger.info(f"Requesting TTS with voice '{req.voice}'...")
             
-            # CHANGE 2: Updated payload for Chatterbox (removed speed/language, added exaggeration)
             tts_req = requests.post(
                 TTS_API,
                 json={
                     "text": response_text,
                     "voice": req.voice,
                     "exaggeration": 0.6,  # Emotion intensity (0.0 - 1.0)
-                    "temperature": 0.7    # Creativity/Randomness
+                    "cfg_weight": 0.3     # Generation creativity
                 },
-                # CHANGE 3: Increased timeout for safety
                 timeout=60
             )
             
@@ -168,7 +168,12 @@ async def dm_turn(req: GameRequest):
                     audio_url = f"http://tts_voice:8002{tts_data['audio_url']}"
                     audio_status = "generated"
                     cloned = tts_data.get("cloned", False)
-                    logger.info(f"✓ Audio generated (cloned={cloned}): {audio_url}")
+                    truncated = tts_data.get("truncated", False)
+                    
+                    if truncated:
+                        logger.warning("⚠️ TTS text was truncated!")
+                    
+                    logger.info(f"✓ Audio generated (cloned={cloned}, truncated={truncated}): {audio_url}")
                 else:
                     logger.warning(f"TTS returned non-success: {tts_data}")
                     audio_status = "TTS failed"
@@ -205,6 +210,7 @@ async def root():
         "service": "D&D LLM Brain",
         "status": "running",
         "tts": "Chatterbox (Emotion Enabled)",
+        "max_output": "~150-200 words (optimized for TTS)",
         "endpoints": {
             "health": "/health",
             "dm_turn": "/dm_turn (POST)"
