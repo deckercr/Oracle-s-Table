@@ -5,16 +5,18 @@ services:
     container_name: dnd_postgres
     environment:
       POSTGRES_USER: dm_admin
-      POSTGRES_PASSWORD: secretpassword
+      POSTGRES_PASSWORD: ${DB_PASS:-secretpassword}
       POSTGRES_DB: dungeon_data
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Mount the init script - it will run automatically on first start
+      - ./database/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
     ports:
       - "5432:5432"
     networks:
       - dm_network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U dm_admin"]
+      test: ["CMD-SHELL", "pg_isready -U dm_admin -d dungeon_data"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -27,7 +29,6 @@ services:
       - "8001:8001"
     volumes:
       - shared_images:/shared/images
-      # HOST PATH - Models persist on your machine!
       - ${MODEL_CACHE_PATH:-./model_cache}/diffusers:/data/model_cache
     environment:
       - HF_HOME=/data/model_cache
@@ -57,9 +58,7 @@ services:
       - "8002:8002"
     volumes:
       - shared_audio:/shared/audio
-      # Map cache so model downloads persist (approx 2GB)
       - ~/dnd_models/tts_cache:/root/.cache/huggingface
-      # Map your reference voices
       - ~/dnd_models/reference_voices:/shared/reference_voices
     environment:
       - COQUI_TTS_CACHE=/data/tts_cache
@@ -87,13 +86,15 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # HOST PATH - HuggingFace models persist on your machine!
       - ${MODEL_CACHE_PATH:-./model_cache}/huggingface:/data/model_cache
     environment:
       - HF_TOKEN=${HF_TOKEN}
       - HF_HOME=/data/model_cache
       - TRANSFORMERS_CACHE=/data/model_cache
       - DB_HOST=database
+      - DB_NAME=dungeon_data
+      - DB_USER=dm_admin
+      - DB_PASS=${DB_PASS:-secretpassword}
     depends_on:
       database:
         condition: service_healthy
@@ -137,7 +138,7 @@ services:
       - DB_HOST=database
       - DB_NAME=dungeon_data
       - DB_USER=dm_admin
-      - DB_PASS=secretpassword
+      - DB_PASS=${DB_PASS:-secretpassword}
       - LLM_API=http://llm_brain:8000
       - IMAGE_API=http://image_gen:8001
       - TTS_API=http://tts_voice:8002
@@ -155,4 +156,3 @@ volumes:
   postgres_data:
   shared_images:
   shared_audio:
-  # No more model_cache or tts_cache - using host paths now!

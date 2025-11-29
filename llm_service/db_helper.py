@@ -1,11 +1,12 @@
 # ./llm_service/db_helper.py
 """
 Database helper module for D&D Campaign management.
-Handles all database operations for the LLM service.
+FIXED: Now matches docker-compose.yml credentials
 """
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import SimpleConnectionPool
 from contextlib import contextmanager
 import os
 import logging
@@ -14,21 +15,38 @@ logger = logging.getLogger(__name__)
 
 class DatabaseManager:
     def __init__(self):
+        # FIXED: Match docker-compose.yml environment variables
         self.config = {
             'host': os.getenv('DB_HOST', 'database'),
             'database': os.getenv('DB_NAME', 'dungeon_data'),
-            'user': os.getenv('DB_USER', 'llama_user'),
-            'password': os.getenv('DB_PASS', 'llama_secret_pass'),
+            'user': os.getenv('DB_USER', 'dm_admin'),  # FIXED: was 'llama_user'
+            'password': os.getenv('DB_PASS', 'secretpassword'),  # FIXED: was 'llama_secret_pass'
             'port': os.getenv('DB_PORT', '5432')
         }
-        logger.info(f"Database configured: {self.config['user']}@{self.config['host']}/{self.config['database']}")
+        
+        # Connection pool for better performance
+        try:
+            self.pool = SimpleConnectionPool(
+                minconn=1,
+                maxconn=10,
+                **self.config
+            )
+            logger.info(f"✓ Database pool initialized: {self.config['user']}@{self.config['host']}/{self.config['database']}")
+        except Exception as e:
+            logger.error(f"✗ Failed to create connection pool: {e}")
+            self.pool = None
     
     @contextmanager
     def get_connection(self):
-        """Context manager for database connections"""
+        """Context manager for database connections with pooling"""
         conn = None
         try:
-            conn = psycopg2.connect(**self.config)
+            if self.pool:
+                conn = self.pool.getconn()
+            else:
+                # Fallback to direct connection if pool failed
+                conn = psycopg2.connect(**self.config)
+            
             yield conn
             conn.commit()
         except Exception as e:
@@ -38,7 +56,10 @@ class DatabaseManager:
             raise
         finally:
             if conn:
-                conn.close()
+                if self.pool:
+                    self.pool.putconn(conn)
+                else:
+                    conn.close()
     
     def test_connection(self):
         """Test database connectivity"""
@@ -47,11 +68,17 @@ class DatabaseManager:
                 with conn.cursor() as cur:
                     cur.execute("SELECT version();")
                     version = cur.fetchone()[0]
-                    logger.info(f"✓ Database connected: {version}")
+                    logger.info(f"✓ Database connected: {version[:50]}...")
                     return True
         except Exception as e:
             logger.error(f"✗ Database connection failed: {e}")
             return False
+    
+    def close_pool(self):
+        """Close all connections in the pool"""
+        if self.pool:
+            self.pool.closeall()
+            logger.info("✓ Database connection pool closed")
     
     # ========================================
     # CAMPAIGN OPERATIONS
@@ -124,7 +151,6 @@ class DatabaseManager:
                     LIMIT %s
                 """, (campaign_id, limit))
                 results = cur.fetchall()
-                # Reverse to get chronological order
                 return [dict(row) for row in reversed(results)]
     
     def get_conversation_context(self, campaign_id, limit=5):
@@ -145,7 +171,6 @@ class DatabaseManager:
         """Save a story segment/scene"""
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Get next segment order
                 cur.execute("""
                     SELECT COALESCE(MAX(segment_order), 0) + 1 as next_order
                     FROM story_segments

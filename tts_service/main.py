@@ -1,6 +1,6 @@
 # ./tts_service/main.py
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from pathlib import Path
 import uuid
@@ -9,11 +9,13 @@ import torch
 import torchaudio as ta
 import traceback
 import re
+import io
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="D&D TTS Service - Chatterbox")
+app = FastAPI(title="D&D TTS Service - Chatterbox Streaming")
 
 # Directories
 output_dir = Path("/shared/audio")
@@ -52,44 +54,114 @@ class TTSRequest(BaseModel):
     voice: str = "default"
     exaggeration: float = 0.5
     cfg_weight: float = 0.5
+    stream: bool = False  # NEW: Enable streaming mode
 
 def clean_text_for_tts(text: str) -> str:
     """Clean text to prevent TTS issues"""
-    # Remove any special tokens or formatting
-    text = re.sub(r'<[^>]+>', '', text)  # Remove HTML/XML tags
-    text = re.sub(r'\|[^|]+\|', '', text)  # Remove pipe-delimited tokens
-    
-    # Remove multiple spaces and normalize whitespace
+    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r'\|[^|]+\|', '', text)
     text = re.sub(r'\s+', ' ', text)
-    
-    # Remove markdown formatting
-    text = re.sub(r'\*\*?([^*]+)\*\*?', r'\1', text)  # Bold/italic
-    text = re.sub(r'__?([^_]+)__?', r'\1', text)  # Underline
-    
-    # Strip leading/trailing whitespace
+    text = re.sub(r'\*\*?([^*]+)\*\*?', r'\1', text)
+    text = re.sub(r'__?([^_]+)__?', r'\1', text)
     text = text.strip()
-    
     return text
+
+def split_into_sentences(text: str) -> list:
+    """Split text into sentences for streaming"""
+    # Split on sentence boundaries
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    # Filter out empty sentences
+    sentences = [s.strip() for s in sentences if s.strip()]
+    return sentences
+
+def generate_audio_chunk(text: str, ref_path: str = None, 
+                         exaggeration: float = 0.5, cfg_weight: float = 0.5):
+    """Generate audio for a single text chunk"""
+    try:
+        if ref_path:
+            wav = model.generate(
+                text,
+                audio_prompt_path=ref_path,
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight
+            )
+        else:
+            wav = model.generate(
+                text,
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight
+            )
+        
+        # Convert to bytes
+        buffer = io.BytesIO()
+        ta.save(buffer, wav, model.sr, format="wav")
+        buffer.seek(0)
+        return buffer.read()
+    
+    except Exception as e:
+        logger.error(f"Error generating chunk: {e}")
+        return None
+
+async def stream_audio_generator(sentences: list, ref_path: str = None,
+                                  exaggeration: float = 0.5, cfg_weight: float = 0.5):
+    """Generator function that yields audio chunks"""
+    for i, sentence in enumerate(sentences):
+        logger.info(f"Generating sentence {i+1}/{len(sentences)}: {sentence[:50]}...")
+        
+        audio_bytes = generate_audio_chunk(sentence, ref_path, exaggeration, cfg_weight)
+        
+        if audio_bytes:
+            # Yield metadata + audio in JSON streaming format
+            chunk_data = {
+                "chunk_index": i,
+                "total_chunks": len(sentences),
+                "text": sentence,
+                "audio_size": len(audio_bytes),
+                "status": "success"
+            }
+            
+            # Send metadata
+            yield f"data: {json.dumps(chunk_data)}\n\n".encode('utf-8')
+            
+            # Send audio data (base64 encoded for JSON transport)
+            import base64
+            audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+            audio_packet = {
+                "audio_data": audio_b64,
+                "chunk_index": i
+            }
+            yield f"data: {json.dumps(audio_packet)}\n\n".encode('utf-8')
+            
+            logger.info(f"✓ Sent chunk {i+1}/{len(sentences)}")
+        else:
+            error_packet = {
+                "chunk_index": i,
+                "status": "error",
+                "message": "Failed to generate audio"
+            }
+            yield f"data: {json.dumps(error_packet)}\n\n".encode('utf-8')
+    
+    # Send completion signal
+    completion = {"status": "complete", "total_chunks": len(sentences)}
+    yield f"data: {json.dumps(completion)}\n\n".encode('utf-8')
 
 @app.post("/speak")
 async def speak(req: TTSRequest):
     logger.info("=" * 60)
     logger.info("NEW TTS REQUEST")
     logger.info(f"Text length: {len(req.text)} chars")
-    logger.info(f"Text preview: {req.text[:100]}...")
+    logger.info(f"Stream mode: {req.stream}")
     logger.info(f"Voice: {req.voice}")
-    logger.info(f"Exaggeration: {req.exaggeration}")
-    logger.info(f"CFG Weight: {req.cfg_weight}")
     
     if model is None:
         logger.error("Model is None - cannot generate audio")
         return JSONResponse(
             status_code=500,
-            content={"status": "error", "detail": "Model not loaded - check container logs"}
+            content={"status": "error", "detail": "Model not loaded"}
         )
 
     try:
-        # Clean and sanitize text
+        # Clean text
         text = clean_text_for_tts(req.text)
         
         if not text:
@@ -98,26 +170,17 @@ async def speak(req: TTSRequest):
                 content={"status": "error", "detail": "Empty text after cleaning"}
             )
         
-        # INCREASED: Raise limit to 1000 characters to handle longer narrations
+        # Truncate if too long
         original_length = len(text)
         if len(text) > 1000:
             logger.warning(f"Truncating text from {len(text)} to 1000 chars")
-            # Try to truncate at sentence boundary
             text = text[:1000]
             last_period = max(text.rfind('.'), text.rfind('!'), text.rfind('?'))
-            if last_period > 500:  # Only truncate at sentence if we have enough
+            if last_period > 500:
                 text = text[:last_period + 1]
         
-        logger.info(f"Final text length: {len(text)} chars (original: {original_length})")
-        logger.info(f"Clean text: {text[:150]}...")
-        
-        audio_id = str(uuid.uuid4())
-        filename = output_dir / f"{audio_id}.wav"
-
         # Find reference voice
         ref_path = None
-        logger.info(f"Looking for voice '{req.voice}' in {reference_dir}")
-        
         if req.voice != "default":
             for ext in [".wav", ".mp3"]:
                 p = reference_dir / f"{req.voice}{ext}"
@@ -125,56 +188,63 @@ async def speak(req: TTSRequest):
                     ref_path = str(p)
                     logger.info(f"✓ Found reference: {ref_path}")
                     break
+        
+        # STREAMING MODE
+        if req.stream:
+            logger.info("Starting streaming mode...")
+            sentences = split_into_sentences(text)
+            logger.info(f"Split into {len(sentences)} sentences")
             
-            if not ref_path:
-                logger.warning(f"Voice '{req.voice}' not found")
-                available = list(reference_dir.glob("*.wav")) + list(reference_dir.glob("*.mp3"))
-                logger.info(f"Available voices: {[f.stem for f in available]}")
-        
-        # Generate audio
-        logger.info("Generating audio...")
-        
-        if ref_path:
-            logger.info(f"Using voice clone with exaggeration={req.exaggeration}, cfg_weight={req.cfg_weight}")
-            wav = model.generate(
-                text,
-                audio_prompt_path=ref_path,
-                exaggeration=req.exaggeration,
-                cfg_weight=req.cfg_weight
+            return StreamingResponse(
+                stream_audio_generator(sentences, ref_path, req.exaggeration, req.cfg_weight),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no"
+                }
             )
-            cloned = True
+        
+        # STANDARD MODE (non-streaming)
         else:
-            logger.info(f"Using default voice with exaggeration={req.exaggeration}")
-            wav = model.generate(
-                text,
-                exaggeration=req.exaggeration,
-                cfg_weight=req.cfg_weight
-            )
-            cloned = False
-
-        # Save audio
-        logger.info(f"Saving audio to {filename}")
-        logger.info(f"Audio tensor shape: {wav.shape}")
-        ta.save(str(filename), wav, model.sr)
-        
-        logger.info("✓ Audio generated successfully!")
-        logger.info("=" * 60)
-        
-        return {
-            "status": "success",
-            "audio_url": f"/audio/{audio_id}",
-            "cloned": cloned,
-            "voice_used": req.voice if cloned else "default",
-            "emotion": req.exaggeration,
-            "text_length": len(text),
-            "truncated": len(text) < original_length
-        }
+            audio_id = str(uuid.uuid4())
+            filename = output_dir / f"{audio_id}.wav"
+            
+            logger.info("Generating audio (standard mode)...")
+            
+            if ref_path:
+                wav = model.generate(
+                    text,
+                    audio_prompt_path=ref_path,
+                    exaggeration=req.exaggeration,
+                    cfg_weight=req.cfg_weight
+                )
+                cloned = True
+            else:
+                wav = model.generate(
+                    text,
+                    exaggeration=req.exaggeration,
+                    cfg_weight=req.cfg_weight
+                )
+                cloned = False
+            
+            ta.save(str(filename), wav, model.sr)
+            logger.info("✓ Audio generated successfully!")
+            logger.info("=" * 60)
+            
+            return {
+                "status": "success",
+                "audio_url": f"/audio/{audio_id}",
+                "cloned": cloned,
+                "voice_used": req.voice if cloned else "default",
+                "emotion": req.exaggeration,
+                "text_length": len(text),
+                "truncated": len(text) < original_length
+            }
 
     except Exception as e:
         logger.error("✗ TTS GENERATION FAILED")
         logger.error(f"Error: {e}")
         logger.error(traceback.format_exc())
-        logger.info("=" * 60)
         
         return JSONResponse(
             status_code=500,
@@ -204,18 +274,20 @@ async def health():
         "status": "healthy" if model is not None else "degraded",
         "model": "Chatterbox English TTS",
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "model_loaded": model is not None
+        "model_loaded": model is not None,
+        "streaming_enabled": True
     }
 
 @app.get("/")
 async def root():
     """Service info"""
     return {
-        "service": "Chatterbox TTS",
-        "version": "0.1.2",
+        "service": "Chatterbox TTS with Streaming",
+        "version": "0.2.0",
         "model": "English only",
+        "features": ["Standard mode", "Streaming mode (sentence-by-sentence)"],
         "endpoints": {
-            "speak": "POST /speak",
+            "speak": "POST /speak (set stream=true for streaming)",
             "voices": "GET /voices",
             "audio": "GET /audio/{id}",
             "health": "GET /health"
