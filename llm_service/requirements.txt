@@ -5,3 +5,4 @@ torch
 transformers
 accelerate
 psycopg2-binary
+httpx

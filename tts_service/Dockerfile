@@ -43,12 +43,15 @@ RUN pip install --no-cache-dir git+https://github.com/Vuizur/add-stress-to-epub
 # NOW install chatterbox without dependencies
 RUN pip install --no-cache-dir --no-deps chatterbox-tts>=0.1.2
 
-# Copy app
-COPY main.py .
+# Copy app directory with package structure
+COPY . /app/tts_service
+
+# Set the Python path to include the parent directory of tts_service
+ENV PYTHONPATH="${PYTHONPATH}:/app"
 
 # Create directories
 RUN mkdir -p /data/tts_cache /shared/audio /shared/reference_voices
 
 EXPOSE 8002
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002"]
+CMD ["uvicorn", "tts_service.main:app", "--host", "0.0.0.0", "--port", "8002"]

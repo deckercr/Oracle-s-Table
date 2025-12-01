@@ -5,13 +5,18 @@ Stores conversations, story segments, and retrieves context.
 """
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from transformers import pipeline
+from transformers import pipeline, TextIteratorStreamer
 from pathlib import Path
-import requests
 import torch
 import os
 import logging
+import re
+import asyncio
+from threading import Thread
+import httpx
+import json
 
 # Import our database helper
 from db_helper import db
@@ -20,6 +25,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# SHARED HTTPX CLIENT
+client = httpx.AsyncClient()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await client.aclose()
 
 # INTERNAL NETWORK ADDRESSES
 IMAGE_API = "http://image_gen:8001/generate_image"
@@ -64,30 +76,36 @@ class GameRequest(BaseModel):
     voice: str = "gandalf"
     save_to_db: bool = True  # Whether to save this interaction
 
-def check_service_health(url, timeout=2):
+async def check_service_health(url, timeout=2):
     """Quick non-blocking check if service is available"""
     try:
-        response = requests.get(url, timeout=timeout)
+        response = await client.get(url, timeout=timeout)
         return response.status_code == 200
     except:
         return False
 
-def get_dnd_context(query):
+async def get_dnd_context(query):
     """Fetch D&D rules from API"""
     endpoints = ["spells", "monsters", "classes", "races"]
     query_term = query.split()[-1].lower()
     for endpoint in endpoints:
         try:
             url = f"{DND_API_BASE}/{endpoint}?name={query_term}"
-            resp = requests.get(url, timeout=3).json()
-            if resp.get('count', 0) > 0:
-                index = resp['results'][0]['index']
-                details = requests.get(f"{DND_API_BASE}/{endpoint}/{index}", timeout=3).json()
+            resp = await client.get(url, timeout=3)
+            resp.raise_for_status()
+            json_resp = resp.json()
+
+            if json_resp.get('count', 0) > 0:
+                index = json_resp['results'][0]['index']
+                details_resp = await client.get(f"{DND_API_BASE}/{endpoint}/{index}", timeout=3)
+                details_resp.raise_for_status()
+                details = details_resp.json()
                 return f"RULE ({endpoint}): {details.get('name')}. {str(details.get('desc', ''))[:200]}..."
         except Exception as e:
             logger.debug(f"No {endpoint} found: {e}")
             continue
     return None
+
 
 def build_context_prompt(campaign_id, user_prompt):
     """Build a prompt with campaign context from database"""
@@ -132,6 +150,183 @@ def build_context_prompt(campaign_id, user_prompt):
     
     return "\n".join(context_parts) if context_parts else ""
 
+@app.post("/dm_turn_stream")
+async def dm_turn_stream(req: GameRequest):
+    
+    # 1. Get Campaign ID
+    campaign_id = req.campaign_id
+    if not campaign_id:
+        active = db.get_active_campaign()
+        if active:
+            campaign_id = active['id']
+        else:
+            new_campaign = db.create_campaign("Untitled Adventure", "A new D&D campaign", "balanced")
+            campaign_id = new_campaign['id']
+
+    # 2. Build the prompt (same logic as non-streaming)
+    rule_context = await get_dnd_context(req.prompt)
+    db_context = build_context_prompt(campaign_id, req.prompt)
+    
+    system_msg = """You are a Dungeon Master. Be vivid but concise. 
+    Keep responses to 2-4 sentences maximum - roughly 150-200 words.
+    Focus on the most important and dramatic details.
+    Always complete your thoughts fully but keep it brief and impactful.
+    Use the campaign context to maintain continuity."""
+
+    full_prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_msg}"
+    if db_context:
+        full_prompt += f"\n\nCampaign Context:\n{db_context}"
+    if rule_context:
+        full_prompt += f"\n\nRules: {rule_context}"
+    full_prompt += f"<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{req.prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
+    streamer = TextIteratorStreamer(pipe.tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+    # Run the generation in a separate thread
+    generation_kwargs = dict(
+        streamer=streamer,
+        max_new_tokens=256,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+        eos_token_id=pipe.tokenizer.eos_token_id
+    )
+    
+    # Needs to be a list for the thread to be able to access it
+    prompt_list = [full_prompt]
+    
+    thread = Thread(target=pipe, args=(prompt_list,), kwargs=generation_kwargs)
+    thread.start()
+
+    logger.info("Starting stream generation...")
+
+    async def stream_response_generator():
+        sentence_buffer = ""
+        full_response_text = ""
+        tasks = []
+
+        try:
+            for new_text in streamer:
+                sentence_buffer += new_text
+                
+                # Use regex to find sentences ending with punctuation, followed by a space or end of string
+                # This is more robust than just looking for the character
+                while re.search(r"[.!?]\s*$", sentence_buffer):
+                    match = re.search(r"([^.!?]+[.!?])", sentence_buffer)
+                    if not match:
+                        break
+                    
+                    sentence = match.group(1).strip()
+                    sentence_buffer = sentence_buffer[match.end():]
+
+                    if sentence:
+                        full_response_text += sentence + " "
+                        logger.info(f"Dispatching sentence for TTS: '{sentence}'")
+                        
+                        # Dispatch TTS task concurrently
+                        task = asyncio.create_task(
+                            client.post(
+                                TTS_API,
+                                json={
+                                    "text": sentence,
+                                    "voice": req.voice,
+                                    "exaggeration": 0.6,
+                                    "cfg_weight": 0.3
+                                },
+                                timeout=60
+                            )
+                        )
+                        tasks.append((sentence, task))
+
+            # After the loop, process any remaining text in the buffer
+            if sentence_buffer.strip():
+                sentence = sentence_buffer.strip()
+                full_response_text += sentence
+                logger.info(f"Dispatching final sentence for TTS: '{sentence}'")
+                task = asyncio.create_task(
+                    client.post(
+                        TTS_API,
+                        json={
+                            "text": sentence,
+                            "voice": req.voice,
+                            "exaggeration": 0.6,
+                            "cfg_weight": 0.3
+                        },
+                        timeout=60
+                    )
+                )
+                tasks.append((sentence, task))
+
+            # Yield results as they become available
+            for sentence, task in tasks:
+                try:
+                    response = await task
+                    if response.status_code == 200:
+                        tts_data = response.json()
+                        if tts_data.get("status") == "success":
+                            audio_url = f"http://tts_voice:8002{tts_data['audio_url']}"
+                            logger.info(f"✓ Audio generated for sentence: {audio_url}")
+                            # Yield a JSON object as a string
+                            yield json.dumps({"text": sentence, "audio_url": audio_url}) + "\n"
+                        else:
+                            yield json.dumps({"text": sentence, "error": "TTS failed"}) + "\n"
+                    else:
+                        yield json.dumps({"text": sentence, "error": f"TTS service returned status {response.status_code}"}) + "\n"
+                except Exception as e:
+                    logger.error(f"Error in TTS task for '{sentence}': {e}")
+                    yield json.dumps({"text": sentence, "error": str(e)}) + "\n"
+            
+            # Once all text is generated and processed, save the full response to the DB
+            if req.save_to_db and full_response_text:
+                db.save_conversation(
+                    campaign_id=campaign_id,
+                    user_prompt=req.prompt,
+                    ai_response=full_response_text.strip(),
+                    response_tokens=len(full_response_text.split()),
+                    image_generated=req.generate_image,
+                    audio_generated=True
+                )
+                db.save_story_segment(
+                    campaign_id=campaign_id,
+                    content=full_response_text.strip(),
+                    scene_type="narrative"
+                )
+                logger.info("✓ Full response saved to database.")
+            
+            # 7. Optional: Generate image at the end of the stream
+            if req.generate_image and full_response_text:
+                try:
+                    if await check_service_health("http://image_gen:8001/health", timeout=1):
+                        logger.info("Requesting image generation...")
+                        img_req = await client.post(
+                            IMAGE_API,
+                            json={"description": full_response_text[:150], "style": req.image_style},
+                            timeout=60
+                        )
+                        if img_req.status_code == 200:
+                            img_data = img_req.json()
+                            if img_data.get("status") == "success":
+                                image_url = f"http://image_gen:8001{img_data['image_url']}"
+                                logger.info(f"✓ Image generated: {image_url}")
+                                yield json.dumps({"image_url": image_url}) + "\n"
+                        else:
+                            yield json.dumps({"error": f"Image service returned status {img_req.status_code}"}) + "\n"
+                    else:
+                        logger.warning("Image service not available")
+                        yield json.dumps({"error": "Image service not available"}) + "\n"
+                except Exception as e:
+                    logger.error(f"Image generation error: {e}")
+                    yield json.dumps({"error": f"Image generation error: {e}"}) + "\n"
+
+        except Exception as e:
+            logger.error(f"Error during stream generation: {e}")
+        finally:
+            logger.info("Stream generation finished.")
+
+
+    return StreamingResponse(stream_response_generator(), media_type="application/x-ndjson")
+
+
 @app.post("/dm_turn")
 async def dm_turn(req: GameRequest):
     try:
@@ -154,7 +349,7 @@ async def dm_turn(req: GameRequest):
                 logger.info(f"Created new campaign (ID: {campaign_id})")
         
         # 2. Get D&D rules context
-        rule_context = get_dnd_context(req.prompt)
+        rule_context = await get_dnd_context(req.prompt)
         
         # 3. Get campaign context from database
         db_context = build_context_prompt(campaign_id, req.prompt)
@@ -231,9 +426,9 @@ async def dm_turn(req: GameRequest):
         # 7. Optional: Generate image
         if req.generate_image:
             try:
-                if check_service_health("http://image_gen:8001/health", timeout=1):
+                if await check_service_health("http://image_gen:8001/health", timeout=1):
                     logger.info("Requesting image generation...")
-                    img_req = requests.post(
+                    img_req = await client.post(
                         IMAGE_API,
                         json={"description": response_text[:100], "style": req.image_style},
                         timeout=60
@@ -252,10 +447,10 @@ async def dm_turn(req: GameRequest):
 
         # 8. Generate audio
         try:
-            if check_service_health("http://tts_voice:8002/health", timeout=1):
+            if await check_service_health("http://tts_voice:8002/health", timeout=1):
                 logger.info(f"Requesting TTS with voice '{req.voice}'...")
                 
-                tts_req = requests.post(
+                tts_req = await client.post(
                     TTS_API,
                     json={
                         "text": response_text,
@@ -380,6 +575,7 @@ async def root():
         "endpoints": {
             "health": "GET /health",
             "dm_turn": "POST /dm_turn",
+            "dm_turn_stream": "POST /dm_turn_stream",
             "create_campaign": "POST /campaign/create",
             "get_campaign": "GET /campaign/{id}",
             "get_history": "GET /campaign/{id}/history",

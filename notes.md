@@ -1,4 +1,4 @@
-# Master LLM Notes & Developer Guide
+# Master Notes & Developer Guide
 ## D&D AI Dungeon Master Application
 
 ---
